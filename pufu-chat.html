@@ -109,6 +109,7 @@
   <button data-act="edit">✎ 文を直して声を作り直す</button>
   <button data-act="dict">📖 読み替え辞書に登録</button>
   <button data-act="save">⤓ 音声を保存（mp3）</button>
+  <button data-act="export">📄 会話をテキストで書き出す</button>
   <button data-act="close" class="dim">閉じる</button>
 </div>
 
@@ -155,6 +156,8 @@
   <input id="fishProxy" type="url" placeholder="https://fish-proxy.〇〇.workers.dev">
   <label for="autoplay">返事が来たら自動で声を鳴らす</label>
   <select id="autoplay" class="full"><option value="1">鳴らす</option><option value="0">鳴らさない（▶︎の時だけ）</option></select>
+  <label for="myName">あなたの名前（書き出しの時に使う）</label>
+  <input id="myName" autocomplete="off" placeholder="ミント">
   <label for="autosend">マイクで喋り終わったら自動で送る</label>
   <select id="autosend" class="full"><option value="1">送る</option><option value="0">送らない（確認してから♪）</option></select>
 
@@ -173,13 +176,29 @@
 (() => {
   const $ = id => document.getElementById(id);
   const log=$('log'), status=$('status'), input=$('input'), send=$('send'), mic=$('mic');
-  const G = ['fishKey','fishModel','fishProxy','autoplay','autosend'];
+  const G = ['fishKey','fishModel','fishProxy','autoplay','autosend','myName'];
   const LS = { get:k=>localStorage.getItem('chat.'+k)??'', set:(k,v)=>localStorage.setItem('chat.'+k,v) };
   const uid = () => Math.random().toString(36).slice(2,10);
   const userId = LS.get('userId') || (()=>{const u='mint-'+uid(); LS.set('userId',u); return u;})();
+  const KEEP_AUDIO=300; // 音声を持っておく件数（キャラごと）
+
+  // ---- iPad内の保管庫（IndexedDB）----
+  const DB = (()=>{
+    let dbp=null;
+    const open=()=>dbp||(dbp=new Promise((res,rej)=>{
+      const q=indexedDB.open('puppet-chat',1);
+      q.onupgradeneeded=()=>{ const s=q.result.createObjectStore('msgs',{keyPath:'id'}); s.createIndex('chara','chara'); };
+      q.onsuccess=()=>res(q.result); q.onerror=()=>rej(q.error);
+    }));
+    const tx=async(mode,fn)=>{ const db=await open(); return new Promise((res,rej)=>{ const t=db.transaction('msgs',mode); const r=fn(t.objectStore('msgs')); t.oncomplete=()=>res(r&&r.result!==undefined?r.result:undefined); t.onerror=()=>rej(t.error); }); };
+    return {
+      put:rec=>tx('readwrite',s=>s.put(rec)),
+      list:chara=>tx('readonly',s=>s.index('chara').getAll(chara)).then(a=>(a||[]).sort((x,y)=>x.ts-y.ts)),
+      clear:chara=>tx('readwrite',s=>{ const q=s.index('chara').openKeyCursor(IDBKeyRange.only(chara)); q.onsuccess=()=>{ const c=q.result; if(c){ s.delete(c.primaryKey); c.continue(); } }; }),
+    };
+  })();
 
   // ---- データ ----
-  // chara: {id,name,difyKey,difyUrl,voices:[{id,name,ref}],voiceId,conversationId,dict:[{from,to}]}
   let charas=[]; try{ charas=JSON.parse(LS.get('charas')||'[]'); }catch{ charas=[]; }
   if(!charas.length && localStorage.getItem('pufu.difyKey')){
     const o=k=>localStorage.getItem('pufu.'+k)||'';
@@ -209,21 +228,12 @@
   function unlock(){ if(unlocked) return; player.src=silence; player.play().then(()=>{unlocked=true}).catch(()=>{}); }
   function setStatus(t,err=false){ status.textContent=t||''; status.className=err?'err':''; }
 
-  // ---- 再生キュー（文ごとの音声を順番に鳴らす） ----
+  // ---- 再生キュー ----
   let playToken=0;
-  function playOne(url){
-    return new Promise((res,rej)=>{
-      player.onended=()=>res(); player.onerror=()=>rej(new Error('再生できない'));
-      player.src=url; player.play().catch(rej);
-    });
-  }
+  function playOne(url){ return new Promise((res,rej)=>{ player.onended=()=>res(); player.onerror=()=>rej(new Error('再生できない')); player.src=url; player.play().catch(rej); }); }
   async function playSeq(chunkPromises){
     const my=++playToken;
-    for(const p of chunkPromises){
-      const chunk=await p; if(my!==playToken) return;
-      if(chunk&&chunk.url) await playOne(chunk.url);
-      if(my!==playToken) return;
-    }
+    for(const p of chunkPromises){ const c=await p; if(my!==playToken) return; if(c&&c.blob) await playOne(c.url||(c.url=URL.createObjectURL(c.blob))); if(my!==playToken) return; }
   }
 
   // ---- ヘッダー ----
@@ -236,7 +246,7 @@
     vs.value=(voice()||{}).id||''; vs.style.display=c.voices.length>1?'':'none';
     input.placeholder=c.name+'に話しかける';
   }
-  $('charaSel').onchange=e=>{ current=e.target.value; LS.set('currentChara',current); log.innerHTML=''; playToken++; renderHeader(); setStatus(''); };
+  $('charaSel').onchange=e=>{ current=e.target.value; LS.set('currentChara',current); playToken++; renderHeader(); setStatus(''); loadLog(); };
   $('voiceSel').onchange=e=>{ const c=chara(); c.voiceId=e.target.value; saveCharas(); setStatus('声を「'+voice().name+'」にした'); };
 
   // ---- 設定画面 ----
@@ -255,7 +265,7 @@
         <div class="voices"></div><button type="button" class="add addv">＋ 声を追加</button>
         <label>読み替え辞書（元の言葉 ／ 読ませ方）</label>
         <div class="dict"></div><button type="button" class="add addd">＋ 言葉を追加</button>
-        <div class="quiet"><button type="button" class="link reset">この子との会話をリセット（記憶を最初から）</button></div>`;
+        <div class="quiet"><button type="button" class="link reset">この子との会話をリセット（記憶もログも最初から）</button></div>`;
       card.querySelector('.cname').value=c.name||'';
       card.querySelector('.dkey').value=c.difyKey||'';
       card.querySelector('.durl').value=c.difyUrl||'https://api.dify.ai/v1';
@@ -271,7 +281,7 @@
       card.querySelector('.addv').onclick=()=>pairRow(vbox,uid(),'','','名前','モデルID');
       card.querySelector('.addd').onclick=()=>pairRow(dbox,null,'','','元の言葉','読ませ方');
       card.querySelector('.del').onclick=()=>{ if(confirm(`「${c.name}」を消す？`)) card.remove(); };
-      card.querySelector('.reset').onclick=()=>{ c.conversationId=''; saveCharas(); if(c.id===current) log.innerHTML=''; setStatus(c.name+'との会話をリセットした'); };
+      card.querySelector('.reset').onclick=async()=>{ if(!confirm(c.name+'との会話を全部消す？（戻せない）')) return; c.conversationId=''; saveCharas(); await DB.clear(c.id); if(c.id===current){ log.innerHTML=''; msgs.clear(); } setStatus(c.name+'との会話をリセットした'); };
       list.append(card);
     });
   }
@@ -287,7 +297,7 @@
         voices,voiceId:voices.some(v=>v.id===old.voiceId)?old.voiceId:(voices[0]||{}).id,conversationId:old.conversationId||'',dict});
     });
     charas=next; saveCharas();
-    if(!charas.some(c=>c.id===current)){ current=(charas[0]||{}).id; LS.set('currentChara',current||''); }
+    if(!charas.some(c=>c.id===current)){ current=(charas[0]||{}).id; LS.set('currentChara',current||''); loadLog(); }
   }
   $('openSettings').onclick=()=>{ renderSettings(); $('settings').classList.add('open'); };
   $('cancelSettings').onclick=()=>$('settings').classList.remove('open');
@@ -295,18 +305,33 @@
   $('addChara').onclick=()=>{ collectSettings(); charas.push({id:uid(),name:'',difyKey:'',difyUrl:'https://api.dify.ai/v1',voices:[],voiceId:null,conversationId:'',dict:[]}); renderSettings(); window.scrollTo(0,document.body.scrollHeight); };
   const ready=()=>{ const c=chara(); return c&&c.difyKey&&LS.get('fishKey')&&voice()&&voice().ref; };
 
-  // ---- 表示 ----
-  const msgs=new Map(); // row -> {text, chunks:[{text,url,blob}], busy}
-  function addMsg(who,text){
+  // ---- 表示・保存 ----
+  const msgs=new Map(); // row -> rec {id,chara,who,text,ts,chunks:[{text,blob}]|null,busy}
+  function addMsg(who,text,rec){
     const row=document.createElement('div'); row.className='msg '+who;
     const b=document.createElement('div'); b.className='bubble'; b.textContent=text;
-    let btn=null;
     if(who==='chara'){
-      btn=document.createElement('button'); btn.className='replay'; btn.textContent='▶︎'; btn.disabled=true; btn.type='button';
+      const btn=document.createElement('button'); btn.className='replay'; btn.textContent='▶︎'; btn.type='button';
+      btn.disabled=!(rec&&rec.chunks&&rec.chunks.length);
       row.append(btn,b); attachLongPress(b,row);
+      if(rec&&rec.edited) b.classList.add('edited');
     } else row.append(b);
-    log.append(row); log.scrollTop=log.scrollHeight;
-    return {row,b,btn};
+    log.append(row);
+    const r=rec||{id:uid(),chara:chara().id,who,text,ts:Date.now(),chunks:null};
+    msgs.set(row,r);
+    if(who==='chara') row.querySelector('.replay').onclick=()=>{ unlock(); playSeq((r.chunks||[]).map(c=>Promise.resolve(c))).catch(e=>setStatus('再生できない：'+e.message,true)); };
+    return {row,b,btn:row.querySelector('.replay'),rec:r};
+  }
+  const persist=rec=>DB.put({id:rec.id,chara:rec.chara,who:rec.who,text:rec.text,ts:rec.ts,edited:!!rec.edited,chunks:rec.chunks?rec.chunks.map(c=>({text:c.text,blob:c.blob})):null}).catch(()=>{});
+  async function loadLog(){
+    log.innerHTML=''; msgs.clear(); playToken++;
+    const c=chara(); if(!c) return;
+    let list=[]; try{ list=await DB.list(c.id); }catch{}
+    // 古い音声は落として容量を守る（文字は残す）
+    const withAudio=list.filter(r=>r.who==='chara'&&r.chunks);
+    for(const r of withAudio.slice(0,Math.max(0,withAudio.length-KEEP_AUDIO))){ r.chunks=null; persist(r); }
+    for(const r of list) addMsg(r.who,r.text,r);
+    log.scrollTop=log.scrollHeight;
   }
 
   // ---- Dify ----
@@ -327,15 +352,10 @@
   }
 
   // ---- Fish Audio ----
-  function applyDict(text){
-    const d=[...(chara().dict||[])].sort((a,b)=>b.from.length-a.from.length);
-    for(const {from,to} of d) text=text.split(from).join(to);
-    return text;
-  }
+  function applyDict(text){ const d=[...(chara().dict||[])].sort((a,b)=>b.from.length-a.from.length); for(const {from,to} of d) text=text.split(from).join(to); return text; }
   function splitSentences(text){
     const parts=(text.match(/[^。！？!?\n]+[。！？!?]*/g)||[]).map(s=>s.trim()).filter(Boolean);
-    const out=[];
-    for(const p of parts){ if(out.length&&(p.length<8||out[out.length-1].length<8)) out[out.length-1]+=p; else out.push(p); }
+    const out=[]; for(const p of parts){ if(out.length&&(p.length<8||out[out.length-1].length<8)) out[out.length-1]+=p; else out.push(p); }
     return out.length?out:[text];
   }
   async function ttsOne(text){
@@ -348,15 +368,12 @@
     if(!r.ok) throw new Error('Fish Audio '+r.status+'：'+(await r.text()).slice(0,160));
     const blob=await r.blob(); return {text,blob,url:URL.createObjectURL(blob)};
   }
-  // 文ごとに並行して作り、できた順に鳴らす
   function synthesize(row,text,autoplay){
-    const m=msgs.get(row)||{}; m.text=text; m.chunks=[]; m.busy=true; msgs.set(row,m);
+    const m=msgs.get(row); m.text=text; m.chunks=null; m.busy=true;
     const btn=row.querySelector('.replay'); btn.disabled=true;
-    const sentences=splitSentences(text);
-    const promises=sentences.map(s=>ttsOne(s));
-    const all=Promise.all(promises).then(chunks=>{ m.chunks=chunks; m.busy=false; btn.disabled=false; setStatus(''); return chunks; })
-      .catch(e=>{ m.busy=false; setStatus(e.message,true); throw e; });
-    btn.onclick=()=>{ unlock(); playSeq(m.chunks.map(c=>Promise.resolve(c))).catch(e=>setStatus('再生できない：'+e.message,true)); };
+    const promises=splitSentences(text).map(s=>ttsOne(s));
+    const all=Promise.all(promises).then(chunks=>{ m.chunks=chunks; m.busy=false; btn.disabled=false; setStatus(''); persist(m); return chunks; })
+      .catch(e=>{ m.busy=false; setStatus(e.message,true); persist(m); throw e; });
     if(autoplay){ playSeq(promises).catch(e=>{ if(!/Fish/.test(e.message)) setStatus('自動再生が止められた。▶︎を押すと鳴る',true); }); }
     return all;
   }
@@ -367,16 +384,16 @@
     if(!ready()){ renderSettings(); $('settings').classList.add('open'); setStatus('先にキーと声を入れて',true); return; }
     unlock(); playToken++;
     input.value=''; send.disabled=true;
-    addMsg('me',text);
-    const wait=addMsg('chara','……'); wait.row.classList.add('thinking');
+    const mine=addMsg('me',text); persist(mine.rec);
+    const wait=addMsg('chara','……'); wait.row.classList.add('thinking'); log.scrollTop=log.scrollHeight;
     try{
       setStatus(chara().name+'が考えてる');
       const answer=await askDify(text);
-      wait.row.classList.remove('thinking'); wait.b.textContent=answer; log.scrollTop=log.scrollHeight;
+      wait.row.classList.remove('thinking'); wait.b.textContent=answer; wait.rec.text=answer; persist(wait.rec); log.scrollTop=log.scrollHeight;
       setStatus('声を作ってる');
       synthesize(wait.row,answer,LS.get('autoplay')!=='0').catch(()=>{});
     }catch(e){
-      wait.row.classList.remove('thinking'); wait.b.textContent='（返事が届かなかった）'; setStatus(e.message,true);
+      wait.row.remove(); msgs.delete(wait.row); setStatus(e.message,true);
     }finally{ send.disabled=false; }
   }
   $('chat').addEventListener('submit',e=>{e.preventDefault();submit();});
@@ -394,6 +411,7 @@
   $('menu').addEventListener('click',e=>{
     const act=e.target.dataset.act; if(!act) return;
     $('menu').classList.remove('open');
+    if(act==='export') return exportLog();
     const m=target&&msgs.get(target); if(!m||act==='close') return;
     if(m.busy){ setStatus('声を作ってる途中。少し待って',true); return; }
     if(act==='edit'){ $('editText').value=m.text; $('editor').classList.add('open'); }
@@ -404,6 +422,7 @@
   $('editGo').onclick=()=>{
     const t=$('editText').value.trim(); $('editor').classList.remove('open'); if(!t||!target) return;
     unlock(); playToken++;
+    const m=msgs.get(target); m.edited=true;
     const b=target.querySelector('.bubble'); b.textContent=t; b.classList.add('edited');
     setStatus('声を作り直してる'); synthesize(target,t,true).catch(()=>{});
   };
@@ -416,13 +435,22 @@
     unlock(); playToken++; setStatus('「'+from+'」を「'+to+'」と読む。声を作り直してる');
     synthesize(target,m.text,true).catch(()=>{});
   };
+  function download(blob,name){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; document.body.append(a); a.click(); a.remove(); }
+  const stamp=()=>{ const d=new Date(), p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`; };
   function saveAudio(m){
-    if(!m.chunks.length){ setStatus('まだ音声がない',true); return; }
-    const blob=new Blob(m.chunks.map(c=>c.blob),{type:'audio/mpeg'});
-    const d=new Date(), pad=n=>String(n).padStart(2,'0');
-    const name=`${chara().name}_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.mp3`;
-    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; document.body.append(a); a.click(); a.remove();
-    setStatus('保存した：'+name);
+    if(!m.chunks||!m.chunks.length){ setStatus('この返事の音声は残ってない（▶︎で作り直せる…のは文を直した時だけ）',true); return; }
+    const name=`${chara().name}_${stamp()}.mp3`;
+    download(new Blob(m.chunks.map(c=>c.blob),{type:'audio/mpeg'}),name); setStatus('保存した：'+name);
+  }
+  function exportLog(){
+    const me=LS.get('myName')||'わたし', c=chara();
+    const lines=[...msgs.values()].sort((a,b)=>a.ts-b.ts).map(r=>{
+      const d=new Date(r.ts), p=n=>String(n).padStart(2,'0');
+      return `[${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}] ${r.who==='me'?me:c.name}：${r.text}`;
+    });
+    if(!lines.length){ setStatus('まだ会話がない',true); return; }
+    const name=`${c.name}_会話_${stamp()}.txt`;
+    download(new Blob([lines.join('\n\n')],{type:'text/plain;charset=utf-8'}),name); setStatus('書き出した：'+name);
   }
 
   // ---- マイク ----
@@ -441,6 +469,7 @@
   mic.onclick=()=>listening?stopMic():startMic();
 
   renderHeader();
+  loadLog();
   if(!ready()){ renderSettings(); $('settings').classList.add('open'); }
 })();
 </script>
