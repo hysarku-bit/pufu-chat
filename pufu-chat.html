@@ -106,21 +106,25 @@
 
 <!-- 長押しメニュー -->
 <div class="menu" id="menu">
-  <button data-act="edit">✎ 文を直して声を作り直す</button>
-  <button data-act="dict">📖 読み替え辞書に登録</button>
-  <button data-act="save">⤓ 音声を保存（mp3）</button>
+  <button data-act="edit" data-for="chara">✎ 文を直して声を作り直す</button>
+  <button data-act="dict" data-for="chara">📖 読み替え辞書に登録</button>
+  <button data-act="save" data-for="chara">⤓ 音声を保存（mp3）</button>
+  <button data-act="editme" data-for="me">✎ 文を直す（見た目だけ）</button>
+  <button data-act="redo" data-for="me">↻ 直して送り直す（軽い）</button>
+  <button data-act="rewind" data-for="me">⟲ ここから巻き戻してやり直す</button>
+  <button data-act="del">🗑 この吹き出しを消す</button>
   <button data-act="export">📄 会話をテキストで書き出す</button>
   <button data-act="close" class="dim">閉じる</button>
 </div>
 
 <!-- 編集 -->
 <div class="sheet" id="editor">
-  <h2>文を直す</h2>
-  <p>直した文で声を作り直す。画面の文字も直した方に変わる（キャラ側の記憶は元のまま）。</p>
+  <h2 id="editTitle">文を直す</h2>
+  <p id="editDesc"></p>
   <textarea class="full" id="editText"></textarea>
   <div class="row">
     <button type="button" id="editCancel">やめる</button>
-    <button type="button" class="primary" id="editGo">声を作り直す</button>
+    <button type="button" class="primary" id="editGo">決定</button>
   </div>
 </div>
 
@@ -193,7 +197,8 @@
     const tx=async(mode,fn)=>{ const db=await open(); return new Promise((res,rej)=>{ const t=db.transaction('msgs',mode); const r=fn(t.objectStore('msgs')); t.oncomplete=()=>res(r&&r.result!==undefined?r.result:undefined); t.onerror=()=>rej(t.error); }); };
     return {
       put:rec=>tx('readwrite',s=>s.put(rec)),
-      list:chara=>tx('readonly',s=>s.index('chara').getAll(chara)).then(a=>(a||[]).sort((x,y)=>x.ts-y.ts)),
+      list:chara=>tx('readonly',s=>s.index('chara').getAll(chara)).then(a=>(a||[]).sort((x,y)=>(x.ts-y.ts)||((x.who==='me'?0:1)-(y.who==='me'?0:1)))),
+      del:id=>tx('readwrite',s=>s.delete(id)),
       clear:chara=>tx('readwrite',s=>{ const q=s.index('chara').openKeyCursor(IDBKeyRange.only(chara)); q.onsuccess=()=>{ const c=q.result; if(c){ s.delete(c.primaryKey); c.continue(); } }; }),
     };
   })();
@@ -315,7 +320,7 @@
       btn.disabled=!(rec&&rec.chunks&&rec.chunks.length);
       row.append(btn,b); attachLongPress(b,row);
       if(rec&&rec.edited) b.classList.add('edited');
-    } else row.append(b);
+    } else { row.append(b); attachLongPress(b,row); }
     log.append(row);
     const r=rec||{id:uid(),chara:chara().id,who,text,ts:Date.now(),chunks:null};
     msgs.set(row,r);
@@ -385,7 +390,7 @@
     unlock(); playToken++;
     input.value=''; send.disabled=true;
     const mine=addMsg('me',text); persist(mine.rec);
-    const wait=addMsg('chara','……'); wait.row.classList.add('thinking'); log.scrollTop=log.scrollHeight;
+    const wait=addMsg('chara','……'); wait.rec.ts=mine.rec.ts+1; wait.row.classList.add('thinking'); log.scrollTop=log.scrollHeight;
     try{
       setStatus(chara().name+'が考えてる');
       const answer=await askDify(text);
@@ -402,30 +407,89 @@
   // ---- 長押しメニュー ----
   let target=null, pressTimer=null;
   function attachLongPress(el,row){
-    const start=()=>{ pressTimer=setTimeout(()=>{ target=row; $('menu').classList.add('open'); if(navigator.vibrate) navigator.vibrate(10); },500); };
+    const start=()=>{ pressTimer=setTimeout(()=>{ target=row; openMenuFor(row); if(navigator.vibrate) navigator.vibrate(10); },500); };
     const cancel=()=>clearTimeout(pressTimer);
     el.addEventListener('touchstart',start,{passive:true}); el.addEventListener('touchend',cancel); el.addEventListener('touchmove',cancel); el.addEventListener('touchcancel',cancel);
     el.addEventListener('mousedown',start); el.addEventListener('mouseup',cancel); el.addEventListener('mouseleave',cancel);
     el.addEventListener('contextmenu',e=>e.preventDefault());
   }
+  const ordered=()=>[...msgs.entries()].map(([row,rec])=>({row,rec}))
+    .sort((a,b)=>(a.rec.ts-b.rec.ts)||((a.rec.who==='me'?0:1)-(b.rec.who==='me'?0:1)));
+  function openMenuFor(row){
+    const who=(msgs.get(row)||{}).who;
+    $('menu').querySelectorAll('button[data-for]').forEach(b=>{ b.style.display=(b.dataset.for===who)?'':'none'; });
+    $('menu').classList.add('open');
+  }
+  let editMode='chara';
   $('menu').addEventListener('click',e=>{
     const act=e.target.dataset.act; if(!act) return;
     $('menu').classList.remove('open');
     if(act==='export') return exportLog();
     const m=target&&msgs.get(target); if(!m||act==='close') return;
     if(m.busy){ setStatus('声を作ってる途中。少し待って',true); return; }
-    if(act==='edit'){ $('editText').value=m.text; $('editor').classList.add('open'); }
-    if(act==='dict'){ $('dictFrom').value=''; $('dictTo').value=''; $('dictSheet').classList.add('open'); }
-    if(act==='save') saveAudio(m);
+    if(act==='del') return delMsg(target,m);
+    if(act==='dict'){ $('dictFrom').value=''; $('dictTo').value=''; $('dictSheet').classList.add('open'); return; }
+    if(act==='save') return saveAudio(m);
+    if(act==='edit'||act==='editme'||act==='redo'||act==='rewind'){
+      editMode=act;
+      const T={edit:['文を直す','直した文で声を作り直す。画面の文字も変わる（キャラ側の記憶は元のまま）。','声を作り直す'],
+               editme:['文を直す','画面の見た目だけ直す。相手の記憶も返事も変わらない。','直す'],
+               redo:['直して送り直す','直した文でもう一度返事をもらう。相手の記憶には「言い直した」形で両方残る。','送り直す'],
+               rewind:['ここから巻き戻す','ここから後を全部消して、この文からやり直す。相手の記憶からも消える（それまでの流れを渡し直すので少し時間と料金がかかる）。','巻き戻してやり直す']}[act];
+      $('editTitle').textContent=T[0]; $('editDesc').textContent=T[1]; $('editGo').textContent=T[2];
+      $('editText').value=m.text; $('editor').classList.add('open');
+    }
   });
   $('editCancel').onclick=()=>$('editor').classList.remove('open');
   $('editGo').onclick=()=>{
     const t=$('editText').value.trim(); $('editor').classList.remove('open'); if(!t||!target) return;
-    unlock(); playToken++;
-    const m=msgs.get(target); m.edited=true;
-    const b=target.querySelector('.bubble'); b.textContent=t; b.classList.add('edited');
-    setStatus('声を作り直してる'); synthesize(target,t,true).catch(()=>{});
+    const m=msgs.get(target); const row=target;
+    if(editMode==='edit'){
+      unlock(); playToken++; m.edited=true;
+      const b=row.querySelector('.bubble'); b.textContent=t; b.classList.add('edited');
+      setStatus('声を作り直してる'); synthesize(row,t,true).catch(()=>{}); return;
+    }
+    if(editMode==='editme'){
+      m.text=t; m.edited=true; row.querySelector('.bubble').textContent=t; persist(m); setStatus('直した'); return;
+    }
+    if(editMode==='redo'){ redoFrom(row,m,t); return; }
+    if(editMode==='rewind'){ rewindTo(row,m,t); return; }
   };
+  function delMsg(row,m){
+    if(!confirm('この吹き出しを消す？（相手の記憶には残ったまま）')) return;
+    row.remove(); msgs.delete(row); DB.del(m.id).catch(()=>{}); setStatus('消した');
+  }
+  function cutAfter(rec,inclusive){
+    for(const {row,rec:r} of ordered()){
+      const after=(r.ts>rec.ts)||(r.ts===rec.ts&&r.who!=='me')||(inclusive&&r.id===rec.id);
+      if(after && (r.ts>=rec.ts)){ row.remove(); msgs.delete(row); DB.del(r.id).catch(()=>{}); }
+    }
+  }
+  async function replyTo(query,shownText){
+    unlock(); playToken++; send.disabled=true;
+    const mine=addMsg('me',shownText); persist(mine.rec);
+    const wait=addMsg('chara','……'); wait.rec.ts=mine.rec.ts+1; wait.row.classList.add('thinking'); log.scrollTop=log.scrollHeight;
+    try{
+      setStatus(chara().name+'が考えてる');
+      const answer=await askDify(query);
+      wait.row.classList.remove('thinking'); wait.b.textContent=answer; wait.rec.text=answer; persist(wait.rec); log.scrollTop=log.scrollHeight;
+      setStatus('声を作ってる'); synthesize(wait.row,answer,LS.get('autoplay')!=='0').catch(()=>{});
+    }catch(e){ wait.row.remove(); msgs.delete(wait.row); setStatus(e.message,true); }
+    finally{ send.disabled=false; }
+  }
+  function redoFrom(row,m,t){ cutAfter(m,true); replyTo(t,t); }
+  async function rewindTo(row,m,t){
+    const c=chara(), me=LS.get('myName')||'わたし';
+    const before=ordered().filter(x=>x.rec.ts<m.ts).slice(-40);
+    cutAfter(m,true);
+    const lines=before.map(x=>`${x.rec.who==='me'?me:c.name}：${x.rec.text}`).join('\n');
+    const primer=lines
+      ? '（これまでの私たちのやりとりです。目を通した上で、最後の私の言葉にいつも通り返事をしてください。この前置きには触れずに。）\n\n' + lines + '\n\n' + me + '：' + t
+      : t;
+    c.conversationId=''; saveCharas();
+    setStatus('巻き戻してる');
+    await replyTo(primer,t);
+  }
   $('dictCancel').onclick=()=>$('dictSheet').classList.remove('open');
   $('dictGo').onclick=()=>{
     const from=$('dictFrom').value.trim(), to=$('dictTo').value.trim(); $('dictSheet').classList.remove('open');
@@ -444,7 +508,7 @@
   }
   function exportLog(){
     const me=LS.get('myName')||'わたし', c=chara();
-    const lines=[...msgs.values()].sort((a,b)=>a.ts-b.ts).map(r=>{
+    const lines=[...msgs.values()].sort((a,b)=>(a.ts-b.ts)||((a.who==='me'?0:1)-(b.who==='me'?0:1))).map(r=>{
       const d=new Date(r.ts), p=n=>String(n).padStart(2,'0');
       return `[${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}] ${r.who==='me'?me:c.name}：${r.text}`;
     });
